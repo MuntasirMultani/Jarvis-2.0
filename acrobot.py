@@ -119,6 +119,8 @@ history: dict = {
     "hi": [],
 }
 
+last_user_text = ""
+
 pygame.mixer.init()
 
 
@@ -247,7 +249,7 @@ def transcribe(audio: np.ndarray) -> Tuple[str, str]:
 
     os.unlink(tmp_path)
 
-    text = (result.text or "").strip()
+    text = clean_transcription((result.text or "").strip())
     lang = "en"
 
     # Layer 1: normalise Whisper tag
@@ -268,6 +270,32 @@ def transcribe(audio: np.ndarray) -> Tuple[str, str]:
 
     return text, lang
 
+def clean_transcription(text: str) -> str:
+
+    fillers = {
+        "hmm",
+        "hmmm",
+        "umm",
+        "uh",
+        "uhh",
+        "ah",
+        "ahh",
+        "mmm",
+        "mm",
+        "huh",
+        "hmmm...",
+        "umm...",
+        "uh...",
+    }
+
+    words = text.split()
+
+    cleaned = [
+        w for w in words
+        if w.lower().strip(".,!?") not in fillers
+    ]
+
+    return " ".join(cleaned).strip()
 
 # ──────────────────────────────────────────────
 #  WAKE WORD
@@ -283,10 +311,50 @@ def is_wake_word(text: str) -> bool:
 # ──────────────────────────────────────────────
 
 def get_ai_reply(user_text: str, lang: str) -> str:
-    system       = SYSTEM_HI if lang == "hi" else SYSTEM_EN
+    global last_user_text
+
+    system = SYSTEM_HI if lang == "hi" else SYSTEM_EN
     lang_history = history[lang]
 
-    lang_history.append({"role": "user", "content": user_text})
+    # Context correction for follow-up speech
+    contextual_input = user_text
+
+    if last_user_text:
+
+        short_followups = [
+            "haan",
+            "nahi",
+            "fees",
+            "hostel",
+            "placement",
+            "course",
+            "branch",
+            "department",
+            "admission",
+            "kya",
+            "kitna",
+            "kitni",
+            "yes",
+            "no",
+            "what",
+            "which",
+        ]
+
+        # If current query is short, assume it relates to previous one
+        if (
+            len(user_text.split()) <= 5
+            or any(w in user_text.lower() for w in short_followups)
+        ):
+
+            contextual_input = (
+                f"Previous user query: {last_user_text}\n"
+                f"Current follow-up query: {user_text}"
+            )
+
+    lang_history.append({
+        "role": "user",
+        "content": contextual_input
+    })
 
     response = client.chat.completions.create(
         model=CHAT_MODEL,
@@ -295,13 +363,20 @@ def get_ai_reply(user_text: str, lang: str) -> str:
             *lang_history,
         ],
         max_tokens=MAX_TOKENS,
-        temperature=0.7,
+        temperature=0.5,
     )
 
     reply = response.choices[0].message.content.strip()
-    lang_history.append({"role": "assistant", "content": reply})
-    return reply
 
+    lang_history.append({
+        "role": "assistant",
+        "content": reply
+    })
+
+    # Save latest clean query
+    last_user_text = user_text
+
+    return reply
 
 # ──────────────────────────────────────────────
 #  VOICE SELECTION
@@ -324,10 +399,6 @@ def pick_voice(text: str, lang: str) -> str:
 # ──────────────────────────────────────────────
 #  SPEAK
 # ──────────────────────────────────────────────
-
-async def _tts(text: str, path: str, voice: str):
-    await edge_tts.Communicate(text, voice=voice).save(path)
-
 
 async def _tts(text: str, path: str, voice: str):
     await edge_tts.Communicate(text, voice=voice).save(path)
@@ -356,6 +427,7 @@ def speak(text: str, lang: str = "en"):
         channels=CHANNELS,
         dtype="float32",
         blocksize=blocksize,
+        latency="low",
     ) as stream:
 
         while True:
@@ -371,7 +443,7 @@ def speak(text: str, lang: str = "en"):
 
             rms = float(np.sqrt(np.mean(audio_chunk ** 2)))
 
-            # User started speaking
+            # User interruption started
             if rms >= INTERRUPTION_THRESHOLD:
 
                 # Stop TTS instantly
@@ -382,7 +454,7 @@ def speak(text: str, lang: str = "en"):
                 silence_start = None
                 speech_chunks.append(audio_chunk)
 
-            # User continues speaking
+            # User speaking
             elif recording:
 
                 speech_chunks.append(audio_chunk)
@@ -391,22 +463,21 @@ def speak(text: str, lang: str = "en"):
                     silence_start = time.time()
 
                 # Small natural pause
-                elif time.time() - silence_start >= 0.35:
+                elif time.time() - silence_start >= 1.0:
 
                     speech_duration = len(speech_chunks) * CHUNK_SECS
 
                     # Ignore accidental tiny sounds
-                    if speech_duration < 0.8:
+                    if speech_duration < 1.5:
 
                         speech_chunks = []
                         recording = False
                         silence_start = None
                         continue
 
-                    # Immediately return for transcription
                     break
 
-            # TTS completed normally
+            # TTS finished normally
             elif not pygame.mixer.music.get_busy():
                 break
 
