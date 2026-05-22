@@ -65,14 +65,14 @@ MIN_INTERRUPT_SECS = 1.2
 END_OF_SPEECH_SECS = 0.7
 
 # ── VAD tuning ─────────────────────────────────────────────
-ENERGY_THRESHOLD     = 0.010   # RMS level above which audio counts as "speech"
+ENERGY_THRESHOLD     = 0.018   # RMS level above which audio counts as "speech"
                                # ↑ raise (e.g. 0.025) if background noise triggers false starts
                                # ↓ lower (e.g. 0.010) if mic is quiet and misses your voice
 
-SILENCE_AFTER_SPEECH = 1.5    # seconds of silence that marks end-of-turn
+SILENCE_AFTER_SPEECH = 0.8    # seconds of silence that marks end-of-turn
 PRE_ROLL_CHUNKS      = 6      # chunks buffered before speech onset (avoids clipping first word)
 MIN_SPEECH_SECS      = 0.5    # discard clips shorter than this (accidental noise / breath)
-CHUNK_SECS           = 0.1    # size of each audio chunk in seconds
+CHUNK_SECS           = 0.05    # size of each audio chunk in seconds
 
 IDLE_TIMEOUT         = 10.0   # secs of no speech in LISTENING → go IDLE
 IDLE_POLL_TIMEOUT    = 30.0   # how long to wait for audio in IDLE before re-looping
@@ -94,8 +94,7 @@ SYSTEM_HI = (
     "college se judi sabhi jaankari mein madad karein. "
     "Hamesha Roman/Latin script mein jawab dein — Devanagari (Hindi script) bilkul mat use karein. "
     "Apne uttar chhote aur batcheet ke andaz mein rakhein. "
-    "Koi bullet points ya markdown nahi."
-)
+    "Koi bullet points ya markdown nahi.")
 
 # ──────────────────────────────────────────────
 #  STATE
@@ -226,66 +225,146 @@ def capture_speech(timeout: float) -> Optional[np.ndarray]:
 def transcribe(audio: np.ndarray) -> Tuple[str, str]:
     """
     Returns (text, lang_code) where lang_code is 'hi' or 'en'.
-
-    Language detection uses 3 layers in order:
-      1. Whisper's detected language tag  (quick but sometimes wrong)
-      2. Script scan of the transcribed text  ← THE KEY FIX
-         Whisper always transcribes the correct script even when
-         its language tag is wrong. Devanagari/Arabic in the text
-         means Hindi, period.
-      3. Default → 'en'
     """
+
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_path = tmp.name
 
     sf.write(tmp_path, audio, SAMPLE_RATE)
 
     with open(tmp_path, "rb") as f:
+
         result = client.audio.transcriptions.create(
             model=STT_MODEL,
             file=f,
+            temperature=0,
+            prompt=(
+                "This conversation contains only Hindi and English. "
+                "Keep Hindi in Hindi words and English in English words. "
+                "Do not translate Hindi to English. "
+                "Use Roman Hindi for Hindi speech. "
+                "Do not generate Urdu, Arabic, Tamil, Telugu, Bengali, or other languages. "
+                "Ignore filler sounds like hmm, umm, ahh, mm-hmm, okay, accha. "
+                "Transcribe fast speech accurately."
+            ),
             response_format="json",
         )
 
     os.unlink(tmp_path)
 
-    text = clean_transcription((result.text or "").strip())
+    # Original transcription
+    raw_text = (result.text or "").strip()
+
+    # Remove filler words
+    text = clean_transcription(raw_text)
+
+    # Ignore filler-only speech
+    if is_only_fillers(raw_text):
+        return "", "en"
+
+    # Default language
     lang = "en"
 
-    # Layer 1: normalise Whisper tag
-    if lang == "ur":
-        lang = "hi"
-    if lang not in ("hi", "en"):
-        lang = "en"
+    # Detect Hindi from Devanagari/Urdu script
+    for ch in raw_text:
 
-    # Layer 2: script scan — overrides the tag if script is Hindi
-    for ch in text:
         cp = ord(ch)
-        if 0x0900 <= cp <= 0x097F:   # Devanagari script
+
+        if 0x0900 <= cp <= 0x097F:
             lang = "hi"
             break
-        if 0x0600 <= cp <= 0x06FF:   # Arabic / Urdu script
+
+        if 0x0600 <= cp <= 0x06FF:
             lang = "hi"
             break
+
+    # Detect Roman Hindi keywords
+    hindi_words = {
+        "hai", "haan", "nahi", "kya", "kaise",
+        "kitna", "kitni", "accha", "theek",
+        "hostel", "fees", "admission",
+        "placement", "college", "branch","mera", "meri", "mere",
+        "aap", "tum", "hum",
+        "kab", "ka", "ki",
+        "mein", "main",
+        "kar", "karna",
+        "bol", "bata",
+        "sakta", "sakti",
+        "jana", "chahiye",
+    }
+
+    words = raw_text.lower().split()
+
+    if any(word in hindi_words for word in words):
+        lang = "hi"
 
     return text, lang
 
 def clean_transcription(text: str) -> str:
 
     fillers = {
-        "hmm",
-        "hmmm",
-        "umm",
-        "uh",
-        "uhh",
-        "ah",
-        "ahh",
-        "mmm",
-        "mm",
-        "huh",
+
+        # English fillers
+        "hmm", "hmmm", "hmmmm",
+        "umm", "um", "ummm",
+        "uh", "uhh", "uhhh",
+        "ah", "ahh", "ahhh",
+        "mmm", "mm",
+        "huh", "huhh",
+        "er", "erm",
+        "like",
+        "you know",
+        "i mean",
+        "sort of",
+        "kind of",
+
+        # Indian conversational fillers
+        "accha", "acha", "achha",
+        "haan", "han",
+        "hmm na",
+        "matlab",
+        "toh",
+        "to",
+        "arey",
+        "arre",
+        "acha ji",
+        "theek",
+        "theek hai",
+        "haanji",
+        "ji",
+        "bolo",
+        "sunna",
+        "dekho",
+
+        # Speech hesitation sounds
+        "mm-hmm",
+        "mhm",
+        "hmm-hmm",
+        "ahm",
+        "ahmm",
+        "ahmmm",
+        "ahm-ahmm",
+        "uh-huh",
+        "huh-uh",
+
+        # Confirmation fillers
+        "okay",
+        "ok",
+        "okk",
+        "okayy",
+        "right",
+        "yeah",
+        "yep",
+        "ya",
+        "yup",
+
+        # Variants with punctuation
         "hmmm...",
         "umm...",
         "uh...",
+        "accha...",
+        "okay...",
+        "ahm-ahmm...",
     }
 
     words = text.split()
@@ -296,6 +375,17 @@ def clean_transcription(text: str) -> str:
     ]
 
     return " ".join(cleaned).strip()
+
+def is_only_fillers(text: str) -> bool:
+
+    if not text:
+        return True
+
+    cleaned = clean_transcription(text)
+
+    return cleaned.strip() == ""
+    
+
 
 # ──────────────────────────────────────────────
 #  WAKE WORD
@@ -401,17 +491,59 @@ def pick_voice(text: str, lang: str) -> str:
 # ──────────────────────────────────────────────
 
 async def _tts(text: str, path: str, voice: str):
-    await edge_tts.Communicate(text, voice=voice).save(path)
+
+    # Prevent empty/broken text
+    text = str(text).strip()
+
+    if not text:
+        text = "Sorry, I could not understand."
+
+    # Remove problematic symbols
+    text = text.replace("*", "")
+    text = text.replace("#", "")
+    text = text.replace("`", "")
+
+    try:
+
+        communicate = edge_tts.Communicate(
+            text=text,
+            voice=voice,
+        )
+
+        await communicate.save(path)
+
+    except Exception as e:
+
+        print(f"⚠️ TTS Error: {e}")
+
+        fallback = edge_tts.Communicate(
+            text="Sorry, there was a voice generation problem.",
+            voice="en-US-JennyNeural",
+        )
+
+        await fallback.save(path)
 
 
 def speak(text: str, lang: str = "en"):
+
     voice = pick_voice(text, lang)
     print(f"   🔊 Voice → {voice}")
 
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
         tmp_path = tmp.name
 
-    asyncio.run(_tts(text, tmp_path, voice))
+    # Safe TTS execution
+    try:
+        asyncio.run(_tts(text, tmp_path, voice))
+
+    except Exception as e:
+
+        print(f"⚠️ Async TTS Error: {e}")
+
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+        return None
 
     pygame.mixer.music.load(tmp_path)
     pygame.mixer.music.play()
@@ -462,13 +594,13 @@ def speak(text: str, lang: str = "en"):
                 if silence_start is None:
                     silence_start = time.time()
 
-                # Small natural pause
-                elif time.time() - silence_start >= 1.0:
+                # Natural pause detection
+                elif time.time() - silence_start >= 0.55:
 
                     speech_duration = len(speech_chunks) * CHUNK_SECS
 
                     # Ignore accidental tiny sounds
-                    if speech_duration < 1.5:
+                    if speech_duration < 0.6:
 
                         speech_chunks = []
                         recording = False
@@ -477,14 +609,16 @@ def speak(text: str, lang: str = "en"):
 
                     break
 
-            # TTS finished normally
+            # TTS completed normally
             elif not pygame.mixer.music.get_busy():
                 break
 
             pygame.time.wait(15)
 
     pygame.mixer.music.unload()
-    os.unlink(tmp_path)
+
+    if os.path.exists(tmp_path):
+        os.unlink(tmp_path)
 
     if speech_chunks:
         audio = np.concatenate(speech_chunks, axis=0)
@@ -620,6 +754,7 @@ def main():
                     print("🔍 Transcribing interruption...")
 
                     user_text, lang = transcribe(interrupted_audio)
+                    
 
                     if user_text:
                         print(f"   You [{lang.upper()}] › {user_text}")
