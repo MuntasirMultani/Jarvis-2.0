@@ -13,9 +13,9 @@ acrobot-env\Scripts\activate      # for Windows
 source acrobot-env/bin/activate  # for Linux
 ```
 ### Step 2.2 : 
-'''
+```
 Set -ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-'''
+```
 
 ### Step 3: Upgrade pip
 ```
